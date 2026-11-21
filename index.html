@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+  <title>智能行事曆</title>
+  <meta name="theme-color" content="#4f6bed">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="行事曆">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/icon-180.png">
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@fullcalendar/core@6.1.15/locales/zh-tw.global.min.js"></script>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="nav">
+      <button class="icon-btn" id="prevBtn" aria-label="上一頁">‹</button>
+      <h1 id="calTitle">行事曆</h1>
+      <button class="icon-btn" id="nextBtn" aria-label="下一頁">›</button>
+    </div>
+    <div class="tools">
+      <button class="pill" id="todayBtn">今天</button>
+      <div class="seg" role="tablist">
+        <button data-view="dayGridMonth" class="active">月</button>
+        <button data-view="timeGridWeek">週</button>
+        <button data-view="listMonth">清單</button>
+      </div>
+      <button class="icon-btn" id="settingsBtn" aria-label="設定">⚙︎</button>
+    </div>
+  </header>
+  <button id="syncPill" class="sync-pill" hidden></button>
+
+  <main id="calendar"></main>
+
+  <button class="fab" id="addBtn" aria-label="手動新增行程">＋</button>
+
+  <section class="chat" id="chat">
+    <div class="chat-log" id="chatLog" hidden>
+      <div class="chat-log-head">
+        <span>助理</span>
+        <button class="link-btn" id="clearChat">結束對話</button>
+      </div>
+      <div id="messages"></div>
+    </div>
+    <form class="chat-bar" id="chatForm">
+      <textarea id="chatInput" rows="1" placeholder="描述行程，例如：下週三 2 點開會" enterkeyhint="send"></textarea>
+      <button type="submit" id="sendBtn" aria-label="送出">↑</button>
+    </form>
+  </section>
+
+  <!-- 行程編輯 -->
+  <dialog id="editor">
+    <form method="dialog" id="editorForm">
+      <h2 id="editorTitle">新增行程</h2>
+      <label>事項<input name="title" required placeholder="例如：期末報告"></label>
+      <label class="row-check"><input type="checkbox" name="allDay"> 全天</label>
+      <div class="grid3">
+        <label>日期<input type="date" name="date" required></label>
+        <label class="time-field">開始<input type="time" name="startTime"></label>
+        <label class="time-field">結束<input type="time" name="endTime"></label>
+      </div>
+      <label>種類<select name="category"></select></label>
+      <div class="field">
+        <span class="field-label">提醒</span>
+        <div class="chips" id="reminderChips"></div>
+      </div>
+      <label>備註<textarea name="notes" rows="3" placeholder="地點、要帶的東西…"></textarea></label>
+      <div class="dialog-actions">
+        <button type="button" class="danger" id="deleteBtn">刪除</button>
+        <span class="spacer"></span>
+        <button type="button" id="cancelEdit">取消</button>
+        <button type="submit" class="primary">儲存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 設定 -->
+  <dialog id="settings">
+    <form method="dialog" id="settingsForm">
+      <h2>設定</h2>
+      <fieldset>
+        <legend>AI（Gemini）</legend>
+        <label>Gemini API key<input name="geminiKey" type="password" autocomplete="off" placeholder="AIza..."></label>
+        <label>模型名稱<input name="model" placeholder="gemini-flash-latest"></label>
+        <p class="hint">到 <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio</a> 免費申請。金鑰只存在這支手機。</p>
+      </fieldset>
+      <fieldset>
+        <legend>Google 日曆同步</legend>
+        <label>OAuth Client ID<input name="clientId" autocomplete="off" placeholder="xxxx.apps.googleusercontent.com"></label>
+        <div class="row">
+          <button type="button" id="connectGoogle">連結 Google 日曆</button>
+          <span class="hint" id="googleStatus"></span>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>種類</legend>
+        <div id="catList"></div>
+        <button type="button" class="link-btn" id="addCat">＋ 新增種類</button>
+      </fieldset>
+      <fieldset>
+        <legend>資料</legend>
+        <div class="row">
+          <button type="button" id="exportBtn">匯出備份</button>
+          <label class="file-btn">匯入備份<input type="file" id="importFile" accept="application/json" hidden></label>
+        </div>
+      </fieldset>
+      <div class="dialog-actions">
+        <span class="spacer"></span>
+        <button type="button" id="cancelSettings">取消</button>
+        <button type="submit" class="primary">儲存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>
