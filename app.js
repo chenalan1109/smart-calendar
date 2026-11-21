@@ -310,29 +310,56 @@ ${upcoming}
 10. 使用者的訊息跟排行程無關時，簡短回應並引導他描述要排的事，status="asking"。`;
 }
 
-// 主模型忙線（503/500）或額度用完（429）時，依序改用這些備用模型（各自有獨立額度）
-const FALLBACK_MODELS = ['gemini-flash-lite-latest', 'gemini-2.5-flash', 'gemini-2.5-flash-lite'];
+// 主模型忙線（503/500）、額度用完（429）或不存在（404）時，改用其他模型（各自有獨立額度）
+const FALLBACK_MODELS = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-flash-lite-latest'];
+const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function keyError(status, msg) {
+  if (/API key/i.test(msg) || status === 401) return new Error('Gemini API key 無效，請到設定確認有沒有貼完整。');
+  if (status === 403) return new Error(`這把金鑰沒有權限使用 Gemini：${msg}`);
+  return null;
+}
+
+// 向 Google 查詢這把金鑰能用的文字模型（快取一天）
+async function listModels(key = settings.geminiKey, force = false) {
+  const cache = LS.get('sc.models', null);
+  if (!force && cache && cache.key === key.slice(-6) && Date.now() - cache.at < 86_400_000) return cache.list;
+  let r;
+  try { r = await fetch(`${GEMINI_BASE}/models?pageSize=200`, { headers: { 'x-goog-api-key': key } }); } catch { throw new Error('連不上 Gemini，請確認網路。'); }
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw keyError(r.status, d?.error?.message || '') || new Error(`無法取得模型清單（${r.status}）`);
+  const ver = (n) => parseFloat((n.match(/gemini-(\d+(?:\.\d+)?)/) || [0, 0])[1]);
+  const rank = (n) => (/-latest$/.test(n) ? 2 : /(preview|exp)/.test(n) ? 1 : 0);
+  const list = (d.models || [])
+    .filter((m) => (m.supportedGenerationMethods || []).includes('generateContent'))
+    .map((m) => m.name.replace(/^models\//, ''))
+    .filter((n) => /^gemini/.test(n) && /flash/.test(n) && !/(image|tts|audio|live|embed|vision|robotics|computer|native|thinking)/.test(n))
+    .sort((a, b) => rank(a) - rank(b) || ver(b) - ver(a) || a.localeCompare(b));
+  LS.set('sc.models', { key: key.slice(-6), at: Date.now(), list });
+  return list;
+}
 
 async function callGemini(onStatus = () => {}) {
   if (!settings.geminiKey) throw new Error('還沒設定 Gemini API key，請點右上角 ⚙︎ 設定。');
   const primary = (settings.model || 'gemini-flash-latest').trim();
-  const models = [primary, ...FALLBACK_MODELS.filter((m) => m !== primary)];
   const body = JSON.stringify({
     systemInstruction: { parts: [{ text: systemPrompt() }] },
     contents: convo,
     generationConfig: { responseMimeType: 'application/json', responseSchema: SCHEMA, temperature: 0.3 },
   });
+  let models = [primary];
+  let discovered = false;
   let data = null;
   let lastErr = null;
-  outer:
-  for (let mi = 0; mi < models.length; mi++) {
+  for (let mi = 0; mi < models.length && mi < 7; mi++) {
     const model = models[mi];
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
-    for (let attempt = 0; attempt < 2; attempt++) {
+    const tries = mi === 0 ? 2 : 1;
+    let failed = false;
+    for (let attempt = 0; attempt < tries; attempt++) {
       let r;
       try {
-        r = await fetch(url, {
+        r = await fetch(`${GEMINI_BASE}/models/${encodeURIComponent(model)}:generateContent`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-goog-api-key': settings.geminiKey },
           body,
@@ -341,22 +368,33 @@ async function callGemini(onStatus = () => {}) {
         throw new Error('連不上 Gemini，請確認網路。');
       }
       const d = await r.json().catch(() => ({}));
-      if (r.ok) { data = d; break outer; }
+      if (r.ok) { data = d; break; }
       const msg = d?.error?.message || '';
-      if (r.status === 400 && /API key/i.test(msg)) throw new Error('Gemini API key 無效，請到設定確認。');
-      if (r.status === 503 || r.status === 500) {
-        lastErr = new Error('Gemini 目前忙線中，等一下再試。');
-        if (attempt === 0) { onStatus('Gemini 忙線，重試中…'); await sleep(1500); continue; }
-        break; // 換下一個模型
+      const ke = r.status !== 404 && r.status !== 429 && r.status < 500 ? keyError(r.status, msg) : null;
+      if (ke) throw ke;
+      if (r.status >= 500) {
+        lastErr = new Error('Google 的 Gemini 伺服器目前全部忙線（不是你的問題），請過幾分鐘再試。');
+        if (attempt + 1 < tries) { onStatus('Gemini 忙線，重試中…'); await sleep(1500); continue; }
+      } else if (r.status === 429) {
+        lastErr = new Error('今天的免費額度用完或太頻繁了，等一下再試。');
+      } else if (r.status === 404) {
+        lastErr = new Error(`找不到模型「${model}」。`);
+      } else {
+        throw new Error(`Gemini 錯誤（${r.status}）：${msg || '未知錯誤'}`);
       }
-      if (r.status === 429) { lastErr = new Error('免費額度用完或太頻繁了，等一下再試。'); break; }
-      if (r.status === 404) {
-        lastErr = new Error(`找不到模型「${model}」，請到設定改模型名稱。`);
-        break; // 換下一個模型
-      }
-      throw new Error(`Gemini 錯誤（${r.status}）：${msg || '未知錯誤'}`);
+      failed = true; break;
     }
-    if (mi + 1 < models.length) onStatus(`改用備用模型 ${models[mi + 1]}…`);
+    if (data) {
+      if (model !== primary) { settings.model = model; saveSettings(); toast(`已自動改用 ${model}`); }
+      break;
+    }
+    if (failed && !discovered) {
+      discovered = true;
+      onStatus('尋找其他可用模型…');
+      const list = await listModels().catch(() => FALLBACK_MODELS);
+      models = [...new Set([...models, ...list, ...FALLBACK_MODELS])];
+    }
+    if (mi + 1 < models.length && mi + 1 < 7) onStatus(`改用 ${models[mi + 1]}…`);
   }
   if (!data) throw lastErr || new Error('Gemini 沒有回應，請稍後再試。');
   const parts = data?.candidates?.[0]?.content?.parts || [];
@@ -601,6 +639,52 @@ function refreshGoogleStatus() {
   s.textContent = !settings.clientId ? '尚未設定 Client ID' : hasToken() ? '已連結 ✓' : '未連結（每次開啟約需重新連結一次）';
 }
 
+/* ================= 測試金鑰 ================= */
+async function testModels() {
+  const f = $('#settingsForm');
+  const key = f.geminiKey.value.trim();
+  const box = $('#modelTest');
+  const line = (html) => { const d = document.createElement('div'); d.innerHTML = html; box.appendChild(d); return d; };
+  box.innerHTML = '';
+  if (!key) { line('請先貼上 Gemini API key'); return; }
+  $('#testModels').disabled = true;
+  try {
+    line('查詢這把金鑰可用的模型…');
+    const list = await listModels(key, true);
+    box.innerHTML = '';
+    line(`✅ 金鑰有效，找到 ${list.length} 個可用的 Flash 模型，逐一測試：`);
+    let found = 0;
+    for (const m of list.slice(0, 8)) {
+      const row = line(`<span class="mt-name">${esc(m)}</span> <span class="mt-res">測試中…</span>`);
+      const t0 = performance.now();
+      let txt;
+      try {
+        const r = await fetch(`${GEMINI_BASE}/models/${encodeURIComponent(m)}:generateContent`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+          body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: '只回覆 OK' }] }] }),
+        });
+        const sec = ((performance.now() - t0) / 1000).toFixed(1);
+        txt = r.ok ? `✓ 可用（${sec} 秒）` : r.status >= 500 ? '✗ 伺服器忙線' : r.status === 429 ? '✗ 額度用完' : `✗ 錯誤 ${r.status}`;
+        if (r.ok) {
+          found++;
+          const b = document.createElement('button'); b.type = 'button'; b.className = 'link-btn'; b.textContent = '使用這個';
+          b.onclick = () => { f.model.value = m; toast(`已選 ${m}，記得按儲存`); };
+          row.querySelector('.mt-res').textContent = txt + ' ';
+          row.appendChild(b);
+          continue;
+        }
+      } catch { txt = '✗ 連線失敗'; }
+      row.querySelector('.mt-res').textContent = txt;
+    }
+    line(found ? '👉 點「使用這個」選一個最快的，再按儲存。' : '目前全部忙線，這是 Google 那邊的狀況，過一陣子再試。');
+  } catch (err) {
+    box.innerHTML = ''; line(`❌ ${esc(err.message)}`);
+  } finally {
+    $('#testModels').disabled = false;
+  }
+}
+
 /* ================= 設定 ================= */
 let draftCats = [];
 function renderCats() {
@@ -623,6 +707,7 @@ function openSettings() {
   f.geminiKey.value = settings.geminiKey; f.model.value = settings.model; f.clientId.value = settings.clientId;
   draftCats = settings.categories.map((c) => ({ ...c }));
   renderCats(); refreshGoogleStatus();
+  $('#modelTest').innerHTML = '';
   $('#settings').showModal();
 }
 function applySettingsForm() {
@@ -672,6 +757,7 @@ function bind() {
   // 設定
   $('#settingsForm').addEventListener('submit', (e) => { e.preventDefault(); applySettingsForm(); $('#settings').close(); toast('設定已儲存'); });
   $('#cancelSettings').onclick = () => $('#settings').close();
+  $('#testModels').onclick = testModels;
   $('#addCat').onclick = () => { draftCats.push({ name: '新種類', colorId: '7' }); renderCats(); };
   $('#connectGoogle').onclick = async () => {
     applySettingsForm();
