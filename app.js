@@ -340,63 +340,73 @@ async function listModels(key = settings.geminiKey, force = false) {
   return list;
 }
 
+// 單次呼叫 Gemini，有逾時；不丟例外，回傳結果物件
+async function geminiOnce(model, body, key, timeoutMs, outerSignal) {
+  const ctrl = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, timeoutMs);
+  const onOuter = () => ctrl.abort();
+  outerSignal?.addEventListener('abort', onOuter);
+  const t0 = performance.now();
+  try {
+    const r = await fetch(`${GEMINI_BASE}/models/${encodeURIComponent(model)}:generateContent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+      body,
+      signal: ctrl.signal,
+    });
+    const d = await r.json().catch(() => ({}));
+    return { model, ok: r.ok, status: r.status, data: d, msg: d?.error?.message || '', sec: (performance.now() - t0) / 1000 };
+  } catch {
+    return { model, ok: false, status: timedOut ? 'timeout' : outerSignal?.aborted ? 'cancel' : 'network', msg: '' };
+  } finally {
+    clearTimeout(timer);
+    outerSignal?.removeEventListener('abort', onOuter);
+  }
+}
+const isKeyProblem = (res) => typeof res.status === 'number' && [400, 401, 403].includes(res.status) && keyError(res.status, res.msg);
+function describeFailure(results) {
+  if (results.some((x) => x.status === 429) && results.every((x) => x.status === 429 || x.status === 404)) return new Error('今天的免費額度用完了，明天再試，或到設定換模型。');
+  return new Error('Google 的 Gemini 伺服器目前都忙線或沒回應（不是你的金鑰問題），請過幾分鐘再試。');
+}
+
 async function callGemini(onStatus = () => {}) {
   if (!settings.geminiKey) throw new Error('還沒設定 Gemini API key，請點右上角 ⚙︎ 設定。');
+  const key = settings.geminiKey;
   const primary = (settings.model || 'gemini-flash-latest').trim();
   const body = JSON.stringify({
     systemInstruction: { parts: [{ text: systemPrompt() }] },
     contents: convo,
     generationConfig: { responseMimeType: 'application/json', responseSchema: SCHEMA, temperature: 0.3 },
   });
-  let models = [primary];
-  let discovered = false;
   let data = null;
-  let lastErr = null;
-  for (let mi = 0; mi < models.length && mi < 7; mi++) {
-    const model = models[mi];
-    const tries = mi === 0 ? 2 : 1;
-    let failed = false;
-    for (let attempt = 0; attempt < tries; attempt++) {
-      let r;
-      try {
-        r = await fetch(`${GEMINI_BASE}/models/${encodeURIComponent(model)}:generateContent`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': settings.geminiKey },
-          body,
-        });
-      } catch {
-        throw new Error('連不上 Gemini，請確認網路。');
-      }
-      const d = await r.json().catch(() => ({}));
-      if (r.ok) { data = d; break; }
-      const msg = d?.error?.message || '';
-      const ke = r.status !== 404 && r.status !== 429 && r.status < 500 ? keyError(r.status, msg) : null;
-      if (ke) throw ke;
-      if (r.status >= 500) {
-        lastErr = new Error('Google 的 Gemini 伺服器目前全部忙線（不是你的問題），請過幾分鐘再試。');
-        if (attempt + 1 < tries) { onStatus('Gemini 忙線，重試中…'); await sleep(1500); continue; }
-      } else if (r.status === 429) {
-        lastErr = new Error('今天的免費額度用完或太頻繁了，等一下再試。');
-      } else if (r.status === 404) {
-        lastErr = new Error(`找不到模型「${model}」。`);
-      } else {
-        throw new Error(`Gemini 錯誤（${r.status}）：${msg || '未知錯誤'}`);
-      }
-      failed = true; break;
-    }
-    if (data) {
-      if (model !== primary) { settings.model = model; saveSettings(); toast(`已自動改用 ${model}`); }
-      break;
-    }
-    if (failed && !discovered) {
-      discovered = true;
-      onStatus('尋找其他可用模型…');
-      const list = await listModels().catch(() => FALLBACK_MODELS);
-      models = [...new Set([...models, ...list, ...FALLBACK_MODELS])];
-    }
-    if (mi + 1 < models.length && mi + 1 < 7) onStatus(`改用 ${models[mi + 1]}…`);
+  const first = await geminiOnce(primary, body, key, 15000);
+  if (first.ok) data = first.data;
+  else {
+    if (first.status === 'network') throw new Error('連不上 Gemini，請確認網路。');
+    const ke = isKeyProblem(first); if (ke) throw ke;
+    if (typeof first.status === 'number' && first.status < 500 && ![404, 429].includes(first.status)) throw new Error(`Gemini 錯誤（${first.status}）：${first.msg || '未知錯誤'}`);
+    // 主模型失敗：同時問多個模型，誰先成功就用誰
+    onStatus(`${primary} 沒回應，同時詢問其他模型…`);
+    const list = await listModels(key).catch(() => FALLBACK_MODELS);
+    const cands = [...new Set([...list, ...FALLBACK_MODELS])].filter((m) => m !== primary).slice(0, 8);
+    const ctrl = new AbortController();
+    const results = [first];
+    const winner = await new Promise((resolve) => {
+      let pending = cands.length;
+      if (!pending) resolve(null);
+      cands.forEach((m) => geminiOnce(m, body, key, 25000, ctrl.signal).then((res) => {
+        results.push(res);
+        if (res.ok) resolve(res);
+        else if (--pending === 0) resolve(null);
+      }));
+    });
+    ctrl.abort();
+    if (!winner) throw describeFailure(results);
+    data = winner.data;
+    settings.model = winner.model; saveSettings();
+    toast(`已自動改用 ${winner.model}`);
   }
-  if (!data) throw lastErr || new Error('Gemini 沒有回應，請稍後再試。');
   const parts = data?.candidates?.[0]?.content?.parts || [];
   const text = parts.filter((p) => !p.thought && p.text).map((p) => p.text).join('');
   if (!text) throw new Error('Gemini 沒有回應內容，請換個說法再試。');
@@ -652,31 +662,23 @@ async function testModels() {
     line('查詢這把金鑰可用的模型…');
     const list = await listModels(key, true);
     box.innerHTML = '';
-    line(`✅ 金鑰有效，找到 ${list.length} 個可用的 Flash 模型，逐一測試：`);
+    line(`✅ 金鑰有效，找到 ${list.length} 個可用的 Flash 模型，同時測試中（最多 12 秒）：`);
     let found = 0;
-    for (const m of list.slice(0, 8)) {
+    const ping = JSON.stringify({ contents: [{ role: 'user', parts: [{ text: '只回覆 OK' }] }] });
+    await Promise.all(list.slice(0, 15).map(async (m) => {
       const row = line(`<span class="mt-name">${esc(m)}</span> <span class="mt-res">測試中…</span>`);
-      const t0 = performance.now();
-      let txt;
-      try {
-        const r = await fetch(`${GEMINI_BASE}/models/${encodeURIComponent(m)}:generateContent`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-          body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: '只回覆 OK' }] }] }),
-        });
-        const sec = ((performance.now() - t0) / 1000).toFixed(1);
-        txt = r.ok ? `✓ 可用（${sec} 秒）` : r.status >= 500 ? '✗ 伺服器忙線' : r.status === 429 ? '✗ 額度用完' : `✗ 錯誤 ${r.status}`;
-        if (r.ok) {
-          found++;
-          const b = document.createElement('button'); b.type = 'button'; b.className = 'link-btn'; b.textContent = '使用這個';
-          b.onclick = () => { f.model.value = m; toast(`已選 ${m}，記得按儲存`); };
-          row.querySelector('.mt-res').textContent = txt + ' ';
-          row.appendChild(b);
-          continue;
-        }
-      } catch { txt = '✗ 連線失敗'; }
-      row.querySelector('.mt-res').textContent = txt;
-    }
+      const res = await geminiOnce(m, ping, key, 12000);
+      const out = row.querySelector('.mt-res');
+      if (res.ok) {
+        found++;
+        out.textContent = `✓ 可用（${res.sec.toFixed(1)} 秒） `;
+        const b = document.createElement('button'); b.type = 'button'; b.className = 'link-btn'; b.textContent = '使用這個';
+        b.onclick = () => { f.model.value = m; toast(`已選 ${m}，記得按儲存`); };
+        row.appendChild(b);
+      } else {
+        out.textContent = res.status === 'timeout' ? '✗ 超過 12 秒沒回應' : res.status >= 500 ? '✗ 伺服器忙線' : res.status === 429 ? '✗ 額度用完' : res.status === 'network' ? '✗ 連線失敗' : `✗ 錯誤 ${res.status}`;
+      }
+    }));
     line(found ? '👉 點「使用這個」選一個最快的，再按儲存。' : '目前全部忙線，這是 Google 那邊的狀況，過一陣子再試。');
   } catch (err) {
     box.innerHTML = ''; line(`❌ ${esc(err.message)}`);

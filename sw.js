@@ -1,5 +1,5 @@
 // 離線快取：App 本體與行事曆函式庫走快取優先；Google / Gemini API 一律走網路
-const VERSION = 'sc-v3';
+const VERSION = 'sc-v4';
 const SHELL = [
   './', './index.html', './styles.css', './app.js', './manifest.webmanifest',
   './icons/icon-180.png', './icons/icon-192.png', './icons/icon-512.png',
