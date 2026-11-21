@@ -310,33 +310,55 @@ ${upcoming}
 10. 使用者的訊息跟排行程無關時，簡短回應並引導他描述要排的事，status="asking"。`;
 }
 
-async function callGemini() {
+// 主模型忙線（503/500）或額度用完（429）時，依序改用這些備用模型（各自有獨立額度）
+const FALLBACK_MODELS = ['gemini-flash-lite-latest', 'gemini-2.5-flash', 'gemini-2.5-flash-lite'];
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function callGemini(onStatus = () => {}) {
   if (!settings.geminiKey) throw new Error('還沒設定 Gemini API key，請點右上角 ⚙︎ 設定。');
-  const model = (settings.model || 'gemini-flash-latest').trim();
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
-  const body = {
+  const primary = (settings.model || 'gemini-flash-latest').trim();
+  const models = [primary, ...FALLBACK_MODELS.filter((m) => m !== primary)];
+  const body = JSON.stringify({
     systemInstruction: { parts: [{ text: systemPrompt() }] },
     contents: convo,
     generationConfig: { responseMimeType: 'application/json', responseSchema: SCHEMA, temperature: 0.3 },
-  };
-  let r;
-  try {
-    r = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': settings.geminiKey },
-      body: JSON.stringify(body),
-    });
-  } catch {
-    throw new Error('連不上 Gemini，請確認網路。');
+  });
+  let data = null;
+  let lastErr = null;
+  outer:
+  for (let mi = 0; mi < models.length; mi++) {
+    const model = models[mi];
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let r;
+      try {
+        r = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': settings.geminiKey },
+          body,
+        });
+      } catch {
+        throw new Error('連不上 Gemini，請確認網路。');
+      }
+      const d = await r.json().catch(() => ({}));
+      if (r.ok) { data = d; break outer; }
+      const msg = d?.error?.message || '';
+      if (r.status === 400 && /API key/i.test(msg)) throw new Error('Gemini API key 無效，請到設定確認。');
+      if (r.status === 503 || r.status === 500) {
+        lastErr = new Error('Gemini 目前忙線中，等一下再試。');
+        if (attempt === 0) { onStatus('Gemini 忙線，重試中…'); await sleep(1500); continue; }
+        break; // 換下一個模型
+      }
+      if (r.status === 429) { lastErr = new Error('免費額度用完或太頻繁了，等一下再試。'); break; }
+      if (r.status === 404) {
+        lastErr = new Error(`找不到模型「${model}」，請到設定改模型名稱。`);
+        break; // 換下一個模型
+      }
+      throw new Error(`Gemini 錯誤（${r.status}）：${msg || '未知錯誤'}`);
+    }
+    if (mi + 1 < models.length) onStatus(`改用備用模型 ${models[mi + 1]}…`);
   }
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) {
-    const msg = data?.error?.message || '';
-    if (r.status === 400 && /API key/i.test(msg)) throw new Error('Gemini API key 無效，請到設定確認。');
-    if (r.status === 429) throw new Error('免費額度用完或太頻繁了，等一下再試。');
-    if (r.status === 404) throw new Error(`找不到模型「${model}」，請到設定改模型名稱。`);
-    throw new Error(`Gemini 錯誤（${r.status}）：${msg || '未知錯誤'}`);
-  }
+  if (!data) throw lastErr || new Error('Gemini 沒有回應，請稍後再試。');
   const parts = data?.candidates?.[0]?.content?.parts || [];
   const text = parts.filter((p) => !p.thought && p.text).map((p) => p.text).join('');
   if (!text) throw new Error('Gemini 沒有回應內容，請換個說法再試。');
@@ -391,7 +413,7 @@ async function sendChat(text) {
   setBusy(true);
   const typing = addMsg('bot typing', '思考中…');
   try {
-    const { raw, res } = await callGemini();
+    const { raw, res } = await callGemini((t) => { typing.textContent = t; });
     typing.remove();
     convo.push({ role: 'model', parts: [{ text: raw }] });
     renderAssistant(res);
